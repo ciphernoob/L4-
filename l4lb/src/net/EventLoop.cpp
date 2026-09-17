@@ -2,6 +2,7 @@
 
 #include "net/Channel.h"
 #include "net/Epoller.h"
+#include "net/TimerQueue.h"
 
 #include <cerrno>
 #include <cstdint>
@@ -23,10 +24,12 @@ EventLoop::EventLoop()
     wakeup_channel_.reset(new Channel(this, wakeup_fd_.Get()));
     wakeup_channel_->SetReadCallback([this] { HandleWakeup(); });
     wakeup_channel_->EnableReading();
+    timer_queue_.reset(new TimerQueue(this));
 }
 
 EventLoop::~EventLoop() {
     AssertInLoopThread();
+    timer_queue_.reset();
     wakeup_channel_->Remove();
 }
 
@@ -68,6 +71,19 @@ void EventLoop::QueueInLoop(Functor functor) {
     if (!IsInLoopThread() || running_pending_functors_) {
         Wakeup();
     }
+}
+
+TimerId EventLoop::RunAfter(std::chrono::milliseconds delay, Functor functor) {
+    AssertInLoopThread();
+    return timer_queue_->AddTimer(delay, std::chrono::milliseconds::zero(), std::move(functor));
+}
+
+TimerId EventLoop::RunEvery(std::chrono::milliseconds interval, Functor functor) {
+    AssertInLoopThread();
+    if (interval <= std::chrono::milliseconds::zero()) {
+        throw std::invalid_argument("repeating timer interval must be positive");
+    }
+    return timer_queue_->AddTimer(interval, interval, std::move(functor));
 }
 
 bool EventLoop::IsInLoopThread() const noexcept {
@@ -133,4 +149,3 @@ void EventLoop::RunPendingFunctors() {
 
 }  // namespace net
 }  // namespace l4lb
-

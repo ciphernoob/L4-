@@ -61,8 +61,14 @@ set(L4LB_NET_SOURCES
 if(L4LB_HAVE_EPOLL)
     list(APPEND L4LB_NET_SOURCES
         src/net/Channel.cpp
+        src/net/Acceptor.cpp
         src/net/Epoller.cpp
         src/net/EventLoop.cpp
+        src/net/EventLoopThread.cpp
+        src/net/EventLoopThreadPool.cpp
+        src/net/TimerId.cpp
+        src/net/TimerQueue.cpp
+        src/net/TcpConnection.cpp
     )
 else()
     message(STATUS "sys/epoll.h not found; Linux Reactor sources are excluded")
@@ -74,16 +80,46 @@ target_link_libraries(l4lb_net PUBLIC l4lb_base Threads::Threads)
 l4lb_set_warnings(l4lb_net)
 l4lb_enable_sanitizers(l4lb_net)
 
-add_library(l4lb_lb INTERFACE)
-target_link_libraries(l4lb_lb INTERFACE l4lb_net)
+add_library(l4lb_lb STATIC
+    src/base/AsyncLogger.cpp
+    src/lb/Backend.cpp
+    src/lb/BackendPool.cpp
+    src/lb/Connector.cpp
+    src/lb/HealthChecker.cpp
+    src/lb/LoadBalancer.cpp
+    src/lb/ProxySession.cpp
+    src/lb/SessionMap.cpp
+)
+target_include_directories(l4lb_lb PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_link_libraries(l4lb_lb PUBLIC l4lb_net)
+l4lb_set_warnings(l4lb_lb)
+l4lb_enable_sanitizers(l4lb_lb)
 
-add_library(l4lb_config INTERFACE)
 if(TARGET PkgConfig::JSONCPP)
-    target_link_libraries(l4lb_config INTERFACE PkgConfig::JSONCPP)
+    add_library(l4lb_config STATIC src/config/Config.cpp)
+    target_include_directories(l4lb_config PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    target_link_libraries(l4lb_config PUBLIC PkgConfig::JSONCPP l4lb_lb)
+    l4lb_set_warnings(l4lb_config)
+    l4lb_enable_sanitizers(l4lb_config)
+else()
+    add_library(l4lb_config INTERFACE)
+endif()
+
+if(TARGET PkgConfig::JSONCPP)
+    add_library(l4lb_app_core STATIC src/app/L4ProxyServer.cpp)
+    target_include_directories(l4lb_app_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    target_link_libraries(l4lb_app_core PUBLIC l4lb_config l4lb_lb)
+    l4lb_set_warnings(l4lb_app_core)
+    l4lb_enable_sanitizers(l4lb_app_core)
 endif()
 
 add_executable(l4lb_server src/app/main.cpp)
-target_link_libraries(l4lb_server PRIVATE l4lb_lb l4lb_config)
+if(TARGET PkgConfig::JSONCPP)
+    target_compile_definitions(l4lb_server PRIVATE L4LB_HAS_CONFIG=1)
+    target_link_libraries(l4lb_server PRIVATE l4lb_app_core)
+else()
+    target_link_libraries(l4lb_server PRIVATE l4lb_lb l4lb_config)
+endif()
 l4lb_set_warnings(l4lb_server)
 l4lb_enable_sanitizers(l4lb_server)
 
@@ -96,11 +132,44 @@ if(BUILD_TESTING)
         tests/unit/UniqueFdTest.cpp
     )
     if(L4LB_HAVE_EPOLL)
-        list(APPEND L4LB_UNIT_TEST_SOURCES tests/unit/EventLoopTest.cpp)
+        list(APPEND L4LB_UNIT_TEST_SOURCES
+            tests/unit/EventLoopTest.cpp
+            tests/unit/AsyncLoggerTest.cpp
+            tests/unit/EventLoopThreadTest.cpp
+            tests/unit/AcceptorTest.cpp
+            tests/unit/TimerQueueTest.cpp
+            tests/unit/TcpConnectionTest.cpp
+            tests/unit/ConnectorTest.cpp
+            tests/unit/LoadBalancerTest.cpp
+            tests/unit/HealthCheckerTest.cpp
+            tests/unit/ProxySessionTest.cpp
+        )
+        if(TARGET PkgConfig::JSONCPP)
+            list(APPEND L4LB_UNIT_TEST_SOURCES
+                tests/unit/ConfigTest.cpp
+                tests/unit/L4ProxyServerTest.cpp
+            )
+        endif()
     endif()
     add_executable(l4lb_unit_tests ${L4LB_UNIT_TEST_SOURCES})
-    target_link_libraries(l4lb_unit_tests PRIVATE l4lb_net)
+    target_link_libraries(l4lb_unit_tests PRIVATE l4lb_lb l4lb_config)
+    if(TARGET PkgConfig::JSONCPP)
+        target_link_libraries(l4lb_unit_tests PRIVATE l4lb_app_core)
+    endif()
     l4lb_set_warnings(l4lb_unit_tests)
     l4lb_enable_sanitizers(l4lb_unit_tests)
     add_test(NAME l4lb_unit_tests COMMAND l4lb_unit_tests)
+    if(TARGET PkgConfig::JSONCPP)
+        find_package(Python3 COMPONENTS Interpreter QUIET)
+        if(Python3_Interpreter_FOUND)
+            add_test(
+                NAME l4lb_process_smoke
+                COMMAND ${Python3_EXECUTABLE}
+                    ${CMAKE_CURRENT_SOURCE_DIR}/tests/integration/smoke.py
+                    --server $<TARGET_FILE:l4lb_server>
+                    --config ${CMAKE_CURRENT_SOURCE_DIR}/config/example.json
+            )
+            set_tests_properties(l4lb_process_smoke PROPERTIES RUN_SERIAL TRUE TIMEOUT 10)
+        endif()
+    endif()
 endif()

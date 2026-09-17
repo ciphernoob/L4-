@@ -23,6 +23,7 @@ public:
     int Fd() const noexcept { return fd_.Get(); }
     bool IsValid() const noexcept { return fd_.IsValid(); }
     UniqueFd Release() noexcept { return UniqueFd(fd_.Release()); }
+    void Close() noexcept { fd_.Reset(); }
 
     void SetReuseAddress(bool enabled);
     void Bind(const InetAddress& address);

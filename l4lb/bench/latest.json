@@ -1,0 +1,43 @@
+{
+  "command": "l4lb/build-linux-release/l4lb_server l4lb/config/example.json",
+  "direct": {
+    "concurrency": 16,
+    "elapsed_seconds": 0.2579186470000039,
+    "error_rate": 0.0,
+    "errors": [],
+    "name": "direct",
+    "p50_ms": 7.912681000000532,
+    "p99_ms": 9.688040000000342,
+    "payload_bytes": 16384,
+    "requests": 500,
+    "throughput_mib_per_second": 60.581118045333746
+  },
+  "environment": {
+    "cpu_count": 16,
+    "platform": "Linux loopback"
+  },
+  "parameters": {
+    "concurrency": 16,
+    "config": "l4lb/config/example.json",
+    "output": "l4lb/bench/latest.json",
+    "payload_bytes": 16384,
+    "requests": 500,
+    "server": "l4lb/build-linux-release/l4lb_server"
+  },
+  "proxied": {
+    "concurrency": 16,
+    "elapsed_seconds": 0.2662310649999995,
+    "error_rate": 0.0,
+    "errors": [],
+    "name": "proxied",
+    "p50_ms": 8.301408000001231,
+    "p99_ms": 9.863241000005019,
+    "payload_bytes": 16384,
+    "requests": 500,
+    "throughput_mib_per_second": 58.68961986085294
+  },
+  "proxy_process": {
+    "cpu_seconds_during_run": 0.11,
+    "rss_kib_after_run": 5620
+  }
+}
