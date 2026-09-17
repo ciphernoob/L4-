@@ -125,6 +125,44 @@ Connecting 状态允许在上限内暂存客户端数据。Established 状态把
 
 基准测试在同机固定 CPU/连接数/负载下分别测量直连与代理，报告吞吐、P50/P99、CPU、RSS 和错误率，而不是只给出单个 QPS 数字。HTTP 基准可使用 wrk 验证 TCP 上的常见工作负载，原始 TCP 使用独立客户端工具或仓库内压测程序。
 
+### 12. 用 RAII 明确资源所有权与线程归属
+
+所有内核资源和生命周期计数都由一个明确的 C++ 对象拥有，资源释放绑定到对象析构，不允许业务层散落裸 `close()`、`delete` 或手工配对的计数增减。拥有资源的类型不可复制；需要转移所有权时只允许显式移动。
+
+```cpp
+class UniqueFd {
+public:
+    UniqueFd() noexcept = default;
+    explicit UniqueFd(int fd) noexcept;
+    ~UniqueFd();
+
+    UniqueFd(const UniqueFd&) = delete;
+    UniqueFd& operator=(const UniqueFd&) = delete;
+    UniqueFd(UniqueFd&& other) noexcept;
+    UniqueFd& operator=(UniqueFd&& other) noexcept;
+
+    int get() const noexcept;
+    int release() noexcept;
+    void reset(int fd = -1) noexcept;
+};
+```
+
+资源关系固定如下：
+
+- `Socket` 独占一个 `UniqueFd`；`Acceptor`、`Connector` 和 `TcpConnection` 通过拥有 `Socket` 间接拥有各自 fd。
+- `Connector` 在连接建立期间拥有 pending socket；成功后以移动语义把 `Socket` 移交给 `TcpConnection`，失败、取消或超时时由 `Connector` 析构路径自动关闭。
+- `Channel` 不拥有 fd，只表示该 fd 在某个 `EventLoop` 中的事件注册；拥有 Channel 的对象必须先在所属 loop 线程执行 `Remove()`，再销毁 Channel 和 Socket。
+- `TcpConnection` 拥有其 `Socket`、`Channel`、输入 Buffer 和输出 Buffer；关闭操作负责在 loop 线程解除注册，析构函数只回收已经脱离 epoll 的资源。
+- `SessionMap` 是 `ProxySession` 的强引用根；`ProxySession` 强引用前后端连接和 Connector，连接回调只捕获 `weak_ptr<ProxySession>`，Channel 的 tie/guard 只弱引用连接，避免引用环。
+- 定时器注册返回可取消的 `TimerId`；需要自动随作用域撤销的连接建立超时、空闲超时和健康探测使用 move-only `ScopedTimer`，其 `Cancel()` 和析构均幂等。
+- 后端选择返回 move-only `BackendLease`，构造成功时增加活跃会话数，移动后源对象失效，析构时只扣减一次；任何失败、超时或重复关闭路径都不手工修改计数。
+- `EventLoopThread` 拥有 `std::thread` 和子线程中的 EventLoop 生命周期；析构前必须请求 `Quit()` 并 `join()`，不允许遗留 joinable thread 或 detached thread。
+- `ProxySession::Close()` 是会话资源释放的唯一入口并且幂等；它取消定时器、关闭两端连接并从 SessionMap 移除自身，最终由 RAII 回收 Buffer、Channel、Socket 和 BackendLease。
+
+析构函数不得从任意线程直接执行 `epoll_ctl`。若最后一个外部引用可能在非所属线程释放，必须先通过 `QueueInLoop` 把逻辑关闭与最后一个强引用的释放投递到所属 EventLoop。这样 RAII 负责资源最终回收，EventLoop 线程规则负责回收发生在正确位置，两者共同保证安全。
+
+测试需要验证默认构造、移动构造、移动赋值、`release/reset`、正常关闭、连接失败、超时、取消、重复关闭及异常提前返回；每条路径均要求 fd、Channel、Timer、线程和 backend lease 恰好释放一次。
+
 ## Risks / Trade-offs
 
 - [从教学代码提炼时携带隐藏生命周期缺陷] -> 先完成网络层测试和 sanitizers，再接入代理逻辑；禁止直接整目录复制后开始功能开发。

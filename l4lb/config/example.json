@@ -1,0 +1,10 @@
+{
+  "listen": "0.0.0.0:9000",
+  "admin_listen": "127.0.0.1:9001",
+  "workers": 4,
+  "algorithm": "round_robin",
+  "backends": [
+    {"id": "backend-1", "address": "127.0.0.1:9101", "weight": 1}
+  ]
+}
+
