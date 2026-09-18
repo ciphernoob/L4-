@@ -2,12 +2,12 @@
 
 ## L4 负载均衡器改造
 
-仓库正在新增独立的 C++14 用户态四层 TCP 负载均衡器，历史 `code/dayNN` 教程保持不变：
+仓库包含独立的 C++14 教学版四层 TCP 负载均衡器，历史 `code/dayNN` 教程保持不变：
 
 - [L4 工程说明](l4lb/README.md)
 - [L4 代码阅读与学习指南](l4lb/docs/code-reading-guide.md)
 
-当前已组装为可运行的 L4 服务：包含 Multi-Reactor、双向透明转发、两种调度算法、背压、半关闭、健康检查、管理指标、异步日志和优雅退出。
+当前默认版本为单线程 LT Reactor + 轮询调度，保留非阻塞连接、透明双向转发、逐批背压、TCP 半关闭和 RAII。多线程、健康检查和管理端等完整旧版功能已保存至 [源码快照](l4lb/legacy/README.md)，便于后续进阶学习。
 
 [源仓库地址](https://github.com/yuesong-feng/30dayMakeCppServer/)
 

@@ -1,126 +1,48 @@
 #include "Test.h"
-
-#include "lb/BackendPool.h"
 #include "lb/LoadBalancer.h"
+#include "net/EventLoop.h"
+#include "net/TimerId.h"
 
-#include <atomic>
-#include <map>
-#include <stdexcept>
-#include <thread>
-#include <utility>
-#include <vector>
+#include <sys/socket.h>
 
-using l4lb::lb::BackendConfig;
-using l4lb::lb::BackendLease;
-using l4lb::lb::BackendPool;
-using l4lb::lb::LeastConnectionsLoadBalancer;
-using l4lb::lb::RoundRobinLoadBalancer;
-using l4lb::lb::SelectionError;
-using l4lb::lb::SelectionResult;
+using namespace l4lb::net;
+using l4lb::lb::LoadBalancer;
 
-namespace {
-
-std::vector<BackendConfig> ThreeBackends() {
-    return {{"a", "127.0.0.1", 9001, 1},
-            {"b", "127.0.0.1", 9002, 1},
-            {"c", "127.0.0.1", 9003, 1}};
-}
-
-}  // namespace
-
-L4LB_TEST(BackendPoolRejectsInvalidDefinitions) {
-    bool duplicate = false;
+L4LB_TEST(LoadBalancerRejectsEmptyBackendList) {
+    EventLoop loop;
+    bool rejected = false;
     try {
-        BackendPool pool({{"a", "127.0.0.1", 1, 1}, {"a", "127.0.0.1", 2, 1}});
-        (void)pool;
+        LoadBalancer server(&loop, {"127.0.0.1", 0}, {});
     } catch (const std::invalid_argument&) {
-        duplicate = true;
+        rejected = true;
     }
-    L4LB_REQUIRE(duplicate);
-
-    bool weight = false;
-    try {
-        BackendPool pool({{"a", "127.0.0.1", 1, 0}});
-        (void)pool;
-    } catch (const std::invalid_argument&) {
-        weight = true;
-    }
-    L4LB_REQUIRE(weight);
-
-    bool address = false;
-    try {
-        BackendPool pool({{"a", "bad-ip", 1, 1}});
-        (void)pool;
-    } catch (const std::invalid_argument&) {
-        address = true;
-    }
-    L4LB_REQUIRE(address);
+    L4LB_REQUIRE(rejected);
 }
 
-L4LB_TEST(RoundRobinDistributesAndSkipsUnhealthyBackends) {
-    BackendPool pool(ThreeBackends());
-    RoundRobinLoadBalancer balancer;
-    std::map<std::string, int> counts;
-    for (int index = 0; index < 6; ++index) {
-        SelectionResult result = balancer.Select(pool.Snapshot());
-        L4LB_REQUIRE(static_cast<bool>(result));
-        ++counts[result.lease.Get()->Id()];
-    }
-    L4LB_REQUIRE(counts["a"] == 2);
-    L4LB_REQUIRE(counts["b"] == 2);
-    L4LB_REQUIRE(counts["c"] == 2);
-
-    L4LB_REQUIRE(pool.SetHealthy("b", false));
-    for (int index = 0; index < 10; ++index) {
-        SelectionResult result = balancer.Select(pool.Snapshot());
-        L4LB_REQUIRE(result.lease.Get()->Id() != "b");
-    }
-}
-
-L4LB_TEST(LeastConnectionsUsesStableTieBreakAndRaiiLease) {
-    BackendPool pool(ThreeBackends());
-    LeastConnectionsLoadBalancer balancer;
-    SelectionResult first = balancer.Select(pool.Snapshot());
-    L4LB_REQUIRE(first.lease.Get()->Id() == "a");
-    L4LB_REQUIRE(pool.Find("a")->ActiveSessions() == 1);
-
-    BackendLease moved = std::move(first.lease);
-    L4LB_REQUIRE(!first.lease);
-    L4LB_REQUIRE(pool.Find("a")->ActiveSessions() == 1);
-    SelectionResult second = balancer.Select(pool.Snapshot());
-    L4LB_REQUIRE(second.lease.Get()->Id() == "b");
-    second.lease.Reset();
-    moved.Reset();
-    moved.Reset();
-    L4LB_REQUIRE(pool.Find("a")->ActiveSessions() == 0);
-    L4LB_REQUIRE(pool.Find("b")->ActiveSessions() == 0);
-}
-
-L4LB_TEST(NoAvailableBackendReturnsExplicitErrorAndMetric) {
-    BackendPool pool({{"a", "127.0.0.1", 9001, 1}});
-    RoundRobinLoadBalancer balancer;
-    L4LB_REQUIRE(pool.SetHealthy("a", false));
-    SelectionResult result = balancer.Select(pool.Snapshot());
-    L4LB_REQUIRE(!result);
-    L4LB_REQUIRE(result.error == SelectionError::kNoAvailableBackend);
-    L4LB_REQUIRE(pool.NoAvailableBackendCount() == 1);
-}
-
-L4LB_TEST(BackendSnapshotsCanPublishWhileSelectorsRead) {
-    BackendPool pool(ThreeBackends());
-    RoundRobinLoadBalancer balancer;
-    std::atomic<bool> start{false};
-    std::thread writer([&] {
-        while (!start.load(std::memory_order_acquire)) {
-        }
-        for (int index = 0; index < 2000; ++index) {
-            pool.SetHealthy("b", (index % 2) == 0);
+L4LB_TEST(LoadBalancerReleasesSessionWhenBackendRefuses) {
+    EventLoop loop;
+    // 占用一个没有 listen 的端口，确保 connect 得到拒绝且不会被其他进程抢占。
+    Socket reserved = Socket::CreateTcpNonBlocking();
+    reserved.Bind({"127.0.0.1", 0});
+    LoadBalancer server(&loop, {"127.0.0.1", 0}, {reserved.LocalAddress()});
+    server.Start();
+    Socket client = Socket::CreateTcpNonBlocking();
+    const auto address = server.ListenAddress().SockAddr();
+    const int result = ::connect(client.Fd(), reinterpret_cast<const sockaddr*>(&address),
+                                 sizeof(address));
+    L4LB_REQUIRE(result == 0 || errno == EINPROGRESS);
+    bool finished = false;
+    TimerId check = loop.RunEvery(std::chrono::milliseconds(5), [&] {
+        char byte;
+        const auto count = ::recv(client.Fd(), &byte, 1, 0);
+        if (count == 0 || (count < 0 && errno == ECONNRESET)) {
+            finished = true;
+            L4LB_REQUIRE(server.SessionCount() == 0);
+            loop.Quit();
         }
     });
-    start.store(true, std::memory_order_release);
-    for (int index = 0; index < 5000; ++index) {
-        SelectionResult result = balancer.Select(pool.Snapshot());
-        L4LB_REQUIRE(static_cast<bool>(result));
-    }
-    writer.join();
+    TimerId timeout = loop.RunAfter(std::chrono::seconds(2), [&] { loop.Quit(); });
+    loop.Loop();
+    server.Stop();
+    L4LB_REQUIRE(finished);
 }

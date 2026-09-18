@@ -68,9 +68,8 @@ void EventLoop::QueueInLoop(Functor functor) {
         std::lock_guard<std::mutex> lock(pending_mutex_);
         pending_functors_.push_back(std::move(functor));
     }
-    if (!IsInLoopThread() || running_pending_functors_) {
-        Wakeup();
-    }
+    // 即使在 Loop() 启动前入队，也保证下一次 poll 不会无限等待。
+    Wakeup();
 }
 
 TimerId EventLoop::RunAfter(std::chrono::milliseconds delay, Functor functor) {

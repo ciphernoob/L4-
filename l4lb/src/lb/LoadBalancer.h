@@ -1,48 +1,37 @@
 #pragma once
 
-#include "lb/BackendPool.h"
+#include "net/Acceptor.h"
 
-#include <atomic>
-#include <cstdint>
 #include <memory>
+#include <unordered_map>
+#include <vector>
 
 namespace l4lb {
 namespace lb {
 
-enum class SelectionError {
-    kNone,
-    kNoAvailableBackend,
-};
+class ProxySession;
 
-struct SelectionResult {
-    BackendLease lease;
-    SelectionError error{SelectionError::kNone};
-
-    explicit operator bool() const noexcept { return static_cast<bool>(lease); }
-};
-
+// 服务入口：接入客户端、轮询选后端、拥有全部会话。
 class LoadBalancer {
 public:
-    virtual ~LoadBalancer() = default;
-    virtual SelectionResult Select(const std::shared_ptr<const BackendSnapshot>& snapshot) = 0;
+    LoadBalancer(net::EventLoop* loop, const net::InetAddress& listen,
+                 std::vector<net::InetAddress> backends);
+    ~LoadBalancer();
 
-protected:
-    static SelectionResult NoBackend(const std::shared_ptr<const BackendSnapshot>& snapshot);
-};
-
-class RoundRobinLoadBalancer : public LoadBalancer {
-public:
-    SelectionResult Select(const std::shared_ptr<const BackendSnapshot>& snapshot) override;
+    void Start();
+    void Stop();
+    net::InetAddress ListenAddress() const { return acceptor_.ListenAddress(); }
+    std::size_t SessionCount() const { return sessions_.size(); }
 
 private:
-    std::atomic<std::uint64_t> sequence_{0};
-};
+    void OnNewConnection(net::Socket socket);
 
-class LeastConnectionsLoadBalancer : public LoadBalancer {
-public:
-    SelectionResult Select(const std::shared_ptr<const BackendSnapshot>& snapshot) override;
+    net::EventLoop* loop_;
+    net::Acceptor acceptor_;
+    std::vector<net::InetAddress> backends_;
+    std::size_t next_backend_{0};
+    std::unordered_map<int, std::shared_ptr<ProxySession>> sessions_;
 };
 
 }  // namespace lb
 }  // namespace l4lb
-

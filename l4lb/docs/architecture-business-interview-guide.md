@@ -1,428 +1,161 @@
-# L4 负载均衡器：架构、业务逻辑与面试学习指南
+# 教学版 L4：架构、业务与面试问答
 
-这份文档的目标不是逐行翻译代码，而是帮你建立三层理解：
+本文件只描述当前教学版。完整旧版本的 Multi-Reactor、LC、健康检查、指标和日志已归档，不能作为当前代码的已实现功能介绍。
 
-1. **架构设计**：系统为什么这样分层，线程和对象如何归属。
-2. **业务逻辑**：一条 TCP 连接从接入、选择后端、双向转发到关闭的完整过程。
-3. **关键技术**：Reactor、非阻塞 connect、背压、半关闭、RAII、健康快照与优雅退出如何落地。
-
-阅读时建议同时打开 `src/app/L4ProxyServer.cpp`、`src/lb/ProxySession.cpp` 和 `tests/unit/ProxySessionTest.cpp`。
-
-## 1. 项目定位
-
-本项目是 Linux 用户态四层 TCP full proxy。对每个会话，负载均衡器维护两条独立的 TCP 连接：
+## 1. 架构与定位
 
 ```text
-client              L4 load balancer               backend
-   |                       |                           |
-   |--- frontend TCP ----->|                           |
-   |                       |---- backend TCP -------->|
-   |<========= opaque bidirectional byte stream =====>|
+                  one EventLoop (LT epoll)
+                            |
+                         Acceptor
+                            |
+                      LoadBalancer
+                      /     |     \
+                 Session Session Session
+                  /   \
+             client  backend
 ```
 
-“L4”的核心含义是数据面不理解 HTTP、Redis 或自定义协议，只转发字节。管理端的 HTTP 接口是另一条控制链路，不会让数据面变成 L7 代理。
+这是用户态 IPv4 TCP full proxy。每条客户端连接有独立的后端连接，代理转发不透明字节流；单线程也可以利用非阻塞 I/O 并发维护多条连接。
 
-### 面试问答
+**问：为什么采用单线程？**
 
-**Q：这个项目与 LVS 或 Nginx 有什么区别？**
+答：教学目标是理解连接、事件和字节转发。单线程让会话状态和 Channel 操作自然串行，不需要 worker 分发、跨线程同步和线程退出协调。代价是业务回调无法利用多个 CPU 核心。
 
-A：它是用户态 TCP full proxy，会终止客户端 TCP，再建立后端 TCP，因此可以在用户态做调度、背压、健康检查和指标。LVS 主要在内核转发路径工作，性能与透明性更强；Nginx 既能做 L4 stream 也能做 L7 HTTP，功能和工程成熟度远高于本学习项目。
+**问：单线程是否只能服务一个客户端？**
 
-**Q：既然不解析 HTTP，为什么仍然能代理 HTTP？**
+答：不是。epoll 同时监听多个 fd，只在就绪时执行短回调。不能在回调中执行阻塞 connect、耗时计算或同步等待，否则所有连接都会受影响。
 
-A：HTTP 最终也是 TCP 字节流。只要字节顺序、内容和 TCP 半关闭语义不被破坏，上层协议就能正常工作。
+**问：这是 L4 还是 L7？**
 
-## 2. 总体架构
+答：数据面不解析请求路径、头部或消息类型，只按新 TCP 连接选择后端，因此是 L4。测试后端解析 HTTP 并不意味着代理解析 HTTP。
 
-```text
-                           base/control EventLoop
-                 +------------------------------------+
-                 | data Acceptor   admin Acceptor     |
-                 | HealthChecker   graceful shutdown  |
-                 +-----------------+------------------+
-                                   |
-                         round-robin fd dispatch
-                  +----------------+----------------+
-                  v                v                v
-             worker loop 0    worker loop 1    worker loop N
-             SessionMap       SessionMap       SessionMap
-                  |                |                |
-             ProxySession     ProxySession     ProxySession
-             /          \     /          \     /          \
-       frontend TcpConn  backend TcpConn (same worker thread)
-```
+## 2. LoadBalancer：接入和轮询
 
-代码分层：
+只维护后端地址 vector、next_backend_ 下标和会话 map。接入一次，选择一次，并把两端对应关系交给 ProxySession。
 
-| 层 | 职责 | 核心对象 |
-|---|---|---|
-| `net` | 通用异步网络基础 | `Socket`、`Channel`、`Epoller`、`EventLoop`、`TcpConnection` |
-| `lb` | 负载均衡领域逻辑 | `BackendPool`、`LoadBalancer`、`Connector`、`ProxySession` |
-| `config` | JSON 配置及启动前校验 | `ServerConfig` |
-| `app` | 组装数据面、管理面和生命周期 | `L4ProxyServer`、`main` |
-| `base` | 跨模块基础能力 | `AsyncLogger` |
+**问：轮询是对请求还是连接？**
 
-依赖方向是 `app -> lb -> net -> Linux`。`TcpConnection` 不知道什么是后端或调度算法，从而保持网络库的通用性。
+答：对 TCP 连接。同一连接中的所有消息固定去同一后端。客户端重连时重新轮询，不提供跨连接粘性。
 
-### 面试问答
+**问：为什么不保留策略接口和 BackendPool？**
 
-**Q：为什么不让前端和后端连接分属不同 worker？**
+答：当前只有静态地址和一种算法，直接用 vector 和下标更易读。引入健康状态、多个算法等真实需求时再增加抽象。
 
-A：同一会话的状态、Buffer 和 Channel 都由一个 EventLoop 串行化访问，转发路径无需锁和跨线程拷贝。代价是一个会话只能使用一个 worker 的执行能力，但 TCP 会话本身要求有序，这是合理取舍。
+**问：后端宕机后会自动摘除吗？**
 
-**Q：主 Reactor 会不会成为瓶颈？**
+答：不会。该连接失败后关闭客户端，后续新连接继续轮询。自动摘除、重试和健康检查属于完整旧版，教学版未实现。
 
-A：主 Reactor 只承担 accept、管理端和健康检查，大量字节搬运在 worker 中完成。高新建连接率下仍可能成为瓶颈，可进一步考虑 `SO_REUSEPORT` 多 acceptor、批量投递或更高效的连接分发。
+## 3. Connector：主动建立后端连接
 
-## 3. 模块一：RAII 与资源所有权
+非阻塞 connect 的成功、pending、失败三种结果由一个类处理。pending 期间监听 EPOLLOUT，使用固定三秒超时。
 
-### 架构意图
+**问：可写事件是否说明 connect 成功？**
 
-网络程序的难点不只是成功路径，而是超时、reset、重试和停机交叉时能否只释放一次。项目把资源与对象生命周期绑定：
+答：必须查询 SO_ERROR；连接失败也可能出现可写或错误通知。SO_ERROR 为零才表示连接成功。
 
-- `UniqueFd` move-only，析构时 `close`。
-- `Socket` 拥有 `UniqueFd`，`Channel` 只观察 fd，不关闭 fd。
-- `TimerId` move-only，析构或 `Cancel()` 时幂等取消。
-- `BackendLease` 构造时增加活跃数，析构时减少。
-- `EventLoopThread` 停止后 join，不留 detached 线程。
-- `ProxySession::Close()` 统一释放两端连接、Connector、定时器和 lease。
+**问：连接期间客户端的数据放在哪里？**
 
-### 关键实现
+答：暂不启用客户端读事件，数据先保留在代理内核 TCP 接收缓冲区。后端成功后再开始读。若内核缓冲填满，TCP 流控会约束发送端。
 
-`Channel` 必须先从 EventLoop 中 remove，`Socket` 才能关闭 fd，否则 epoll 可能返回指向已销毁 Channel 的事件。`TcpConnection::ForceClose()` 将这个顺序集中起来。
+**问：为什么不直接阻塞 connect？**
 
-### 面试问答
+答：一个慢后端会阻塞唯一的 EventLoop，影响所有已有连接。非阻塞连接是基础正确性的一部分。
 
-**Q：为什么 `Channel` 不应该拥有 fd？**
+## 4. ProxySession：前后端映射与转发
 
-A：`Channel` 是事件兴趣和回调的适配器，fd 的业务生命周期属于 `Socket/TcpConnection`。分离所有权可避免 Channel 与 Socket 同时 close 造成 double-close，也使 epoll 注册关系更清晰。
+主要读 Start、OnBackendConnected、OnClientMessage、OnBackendMessage、Close 五个函数。用 backend_ 是否存在区分连接阶段，用连接 EOF 标记和 closed_ 表达终止条件，不再维护复杂的状态枚举和扩展选项。
 
-**Q：RAII 能解决所有异步生命周期问题吗？**
+**问：后端连接成功后能切换节点吗？**
 
-A：不能。RAII 解决“对象销毁时如何释放资源”，但异步回调还要解决“对象是否仍存活”。项目使用 `shared_ptr/weak_ptr`、`Channel::Tie()` 和 loop-thread 约束防止悬空回调。
+答：当前会话不能切换。代理不知道应用协议状态，已发送的数据无法安全地重放给新后端。
 
-## 4. 模块二：Reactor 网络核心
+**问：怎么保证会话对象一直存在？**
 
-### 业务逻辑
+答：LoadBalancer 的 map 强持有 ProxySession，ProxySession 持有两个 TcpConnection，连接回调只弱引用会话。Close 时从 map 移除，其他临时引用释放后才析构。
 
-```text
-EventLoop::Loop
-  -> Epoller::Poll
-  -> epoll_wait
-  -> active Channel
-  -> Channel::HandleEvent
-  -> TcpConnection::HandleRead/HandleWrite
-  -> ProxySession callback
-```
+**问：为什么回调不能强引用会话？**
 
-`Epoller` 只做 ADD/MOD/DEL 和就绪事件返回；`Channel` 保存某个 fd 的 interest 与 callback；`EventLoop` 提供线程亲和的执行环境。
+答：会话持有连接，连接又持有回调。回调再强持有会话会形成引用环。weak_ptr::lock 在回调执行期间临时延长生命周期即可。
 
-跨线程任务通过 `QueueInLoop()` 放入队列，然后写 `eventfd` 唤醒阻塞在 `epoll_wait` 的 loop。定时器使用 `timerfd`，因此 socket、唤醒和定时器都可由同一个 epoll 事件模型处理。
+## 5. TcpConnection 与 Buffer：部分读写
 
-### 面试问答
+每次 LT 读事件最多读取 16 KiB，立刻调用消息回调。Send 优先直接写，剩余数据保存到 output_，待 EPOLLOUT 继续。
 
-**Q：`RunInLoop` 和 `QueueInLoop` 有什么区别？**
+**问：为什么没有一直 read 到 EAGAIN？**
 
-A：在 loop 所属线程调用 `RunInLoop` 可立即执行，否则入队；`QueueInLoop` 始终延后到 pending functor 阶段。后者适合避免在当前回调栈中重入修改容器或 Channel。
+答：本版 TcpConnection 使用 LT。只读一批后返回，若仍有未读数据，会再次通知。这也使业务回调有机会暂停读取。若改为 ET，必须重新设计排空和背压配合，不能只切一个标志。
 
-**Q：为什么使用 eventfd，不用条件变量？**
+**问：一次 send 对应一次 read 吗？**
 
-A：条件变量无法直接进入 epoll 等待集。eventfd 是 fd，跨线程写它就能让 `epoll_wait` 立即返回，使唤醒机制与 Reactor 统一。
+答：不对应。TCP 是字节流，接收批次可以拆分或合并。转发必须按长度处理，不能使用 strlen，也不能假设某次读取就是完整请求。
 
-**Q：ET 模式最容易犯什么错？**
+**问：为什么需要 EPOLLOUT？**
 
-A：没有循环 read/accept 到 `EAGAIN`。ET 只在状态变化时通知，本次不排空内核队列可能永久等不到下一次通知。
+答：非阻塞 send 可能部分写或返回 EAGAIN。EPOLLOUT 表示有继续尝试发送的机会；输出为空后关闭监听，避免 LT 下无意义的可写通知。
 
-## 5. 模块三：Multi-Reactor 线程模型
+## 6. 逐批背压
 
-`EventLoopThreadPool` 为每个 worker 创建独立 EventLoop。主线程 accept 后轮询选择 worker，将 move-only `Socket` 投递过去，到 worker 线程后才创建 `TcpConnection` 和注册 Channel。
+目标输出有积压就暂停来源，目标排空后恢复。一次只接收一个 16 KiB 批次，因此转发会话的单方向 output 不会随慢端持续增长。
 
-关键不变式：
+**问：为什么暂停读能够影响发送者？**
 
-- Channel 只能在所属 EventLoop 线程注册、修改和删除。
-- `SessionMap` 只在对应 worker 访问。
-- 会话内部对象不依赖互斥锁；跨 worker 共享的指标和后端计数使用原子变量。
+答：用户态不再 read，内核 TCP 接收缓冲逐渐填满，接收窗口随之缩小，压力传回发送端。代理不应通过丢弃已收到的字节处理背压。
 
-### 面试问答
+**问：为什么不用高低水位？**
 
-**Q：one loop per thread 的优点是什么？**
+答：本版采用更直观的“排空才恢复”。它减少回调和阈值状态，但可能增加启停次数，吞吐表现需要重新测量。高低水位是后续优化方向。
 
-A：用线程归属代替大量锁，同一连接的事件按顺序处理，同时通过多个 loop 利用多核。它也要求所有连接操作遵守线程亲和性，跨线程只能投递任务。
+**问：整个会话是否只占 32 KiB？**
 
-**Q：这里的 worker 调度和后端调度是一回事吗？**
+答：不是。两个方向 output 各最多一个批次，但还有 input Buffer 的分配容量、对象、栈以及两端内核 socket 缓冲。当前也没有全局连接数上限。
 
-A：不是。worker 调度决定本机哪个 EventLoop 处理客户会话；后端调度决定该会话连接哪台业务服务器。
+## 7. 半关闭与资源释放
 
-## 6. 模块四：TcpConnection、Buffer 与字节流
+客户端 EOF 后向后端传播写半关闭，仍允许后端响应。双向 EOF 且输出排空后才 Close；不可恢复错误直接 Close。
 
-### 读路径
+**问：收到 EOF 为什么不直接 close 两端？**
 
-```text
-EPOLLIN -> HandleRead -> read until EAGAIN
-        -> input_buffer.Append
-        -> message_callback(ProxySession)
-```
+答：客户端可能用 shutdown(SHUT_WR) 表示请求结束，并继续等待响应。直接关闭两端会截断响应。
 
-### 写路径
+**问：Close 为什么先设 closed_？**
 
-```text
-Send -> SendInLoop -> try send directly
-                    -> unsent bytes enter output_buffer
-                    -> enable EPOLLOUT
-EPOLLOUT -> HandleWrite -> drain output_buffer
-                         -> disable EPOLLOUT when empty
-```
+答：关闭连接会触发连接关闭回调，回调又调用会话 Close。先设置终态能让重入调用立即返回，避免重复删除和关闭。
 
-`TcpConnection` 不在跨线程 `Send()` 中捕获原始指针，而是先复制成 `std::string` 再投递，避免回调执行时原数据已失效。
+**问：有 shared_ptr 就不需要考虑 epoll 生命周期了吗？**
 
-### 面试问答
+答：epoll 事件数组里保存的是 Channel 裸指针。一次回调关闭另一条连接后，该 Channel 可能仍在当前批次中。需要先取消注册，再保留对象到本批次结束；代码通过 QueueInLoop 的临时强引用实现。
 
-**Q：为什么要有 output buffer？**
+**问：RAII 如何体现？**
 
-A：非阻塞 socket 的 `send` 可能只写一部分或返回 `EAGAIN`。剩余数据必须保存，等 EPOLLOUT 再续写，否则会丢数据。
+答：UniqueFd 关闭 fd，Socket 移交唯一所有权，TimerId 取消连接超时；会话持有连接。逻辑关闭负责先移除 Channel，最终析构负责回收资源。
 
-**Q：TCP 是消息协议吗？一次 send 是否对应一次 read？**
+## 8. EventLoop、定时器与退出
 
-A：不是。TCP 是有序字节流，可能拆包或合并。L4 代理不需要恢复上层消息边界，但必须保证所有字节有序、不丢失、不重复。
+EventLoop 分发 socket、timerfd 和 eventfd 事件，保留底层线程归属断言和任务队列能力，但默认服务不创建 worker。signalfd 将退出信号变成普通回调，Loop 退出后 Stop 关闭全部会话。
 
-**Q：为什么读到 0 不能立即销毁会话？**
+**问：为什么不在 signal handler 中直接删除会话？**
 
-A：读到 0 只表示对端关闭了它的写方向，本端仍可能需要把缓存发完或继续向对端写响应，这是 TCP half-close。
+答：异步 signal handler 中不能任意操作 C++ 容器和引用计数。signalfd 让处理发生在普通 loop 上下文中。
 
-## 7. 模块五：后端模型与调度算法
+**问：是否支持优雅排空和空闲超时？**
 
-`Backend` 包含稳定 id、地址、权重、健康状态与原子活跃会话数。`BackendPool` 对外发布不可变的健康候选快照，选择路径只读快照，不遍历正在修改的容器。
+答：教学版收到终止信号后立即关闭现有连接，没有宽限期；也没有空闲超时，仅保留三秒后端连接超时。不要把完整旧版的功能写入当前版本简历。
 
-- Round Robin：在健康候选中按顺序轮转。
-- Least Connections：选择活跃数最少的节点，平局按配置顺序。
-- 选择成功返回 move-only `BackendLease`，使计数与会话生命周期绑定。
+## 9. 验证方法
 
-### 面试问答
+单元测试覆盖 Buffer、RAII、事件循环、连接成功/失败/取消/超时、双向慢读、部分写、半关闭和 reset。进程测试验证三后端六连接 2/2/2、连接绑定、HTTP、二进制、并发短连接、fd 回收及信号退出。
 
-**Q：Least Connections 一定比 Round Robin 好吗？**
+**问：如何证明背压恢复后没有丢数据？**
 
-A：不一定。LC 适合会话时长差异较大的场景，但“连接数”不等于真实负载，而且需要可靠的全局计数。RR 简单、确定、开销低，后端同质且短连接时往往足够。
+答：双向各发送 2 MiB 确定性二进制数据，先暂停读取制造积压，观察来源停读及 output 上限，再恢复慢读，比较完整内容和长度，并确认 EOF。
 
-**Q：为什么使用不可变快照？**
+**问：ASan 通过能否证明代码一定正确？**
 
-A：健康更新少、选择读取多。copy-on-write 快照把同步成本移到低频更新路径，读者获得一个生命周期稳定的视图，避免遍历时容器被修改。
+答：只能说明已执行路径未发现相关内存错误。还需结合传输内容、生命周期、fd 数量和错误处理测试；不能把测试覆盖范围之外的性质当作已证明。
 
-**Q：节点变为 DOWN 时为什么不关闭已有连接？**
+## 10. 面试介绍示例
 
-A：健康检查只代表新建连接的选择决策。强制中断已有会话会破坏业务，而且已有 TCP 可能仍正常。因此新快照排除 DOWN 节点，旧 lease 继续持有原 Backend。
+> 我将 Reactor 网络库精简为一个 C++14 单线程 L4 TCP 代理。服务按新 TCP 连接轮询选择后端，通过非阻塞 connect 建立后端连接，并绑定两端进行透明字节转发。为了便于理解，我采用 LT epoll 和固定读取批次，目标写缓冲未排空时暂停来源读取，排空后恢复。同时保留部分写、TCP 半关闭、连接超时、RAII 和幂等关闭，用二进制、慢读及故障测试验证行为。
 
-## 8. 模块六：Connector 与主动健康检查
-
-### 非阻塞 connect
-
-```text
-socket(nonblocking)
-  -> connect
-     -> 0: immediate success
-     -> EINPROGRESS: watch EPOLLOUT
-  -> EPOLLOUT
-  -> getsockopt(SO_ERROR)
-     -> 0: transfer Socket ownership
-     -> error: report failure
-```
-
-EPOLLOUT 不等于 connect 成功，必须读 `SO_ERROR`。Connector 同时注册可取消的超时定时器，成功、失败、超时和用户取消最终走幂等清理。
-
-`HealthChecker` 为每个后端周期性创建 Connector，连续失败达阈值才标记 DOWN，连续成功达阈值才恢复 UP，避免短暂抖动导致频繁摘除/恢复。
-
-### 面试问答
-
-**Q：健康检查为什么不与业务会话共用连接？**
-
-A：探测是控制面行为，应当与业务数据和生命周期隔离。独立短连接可测试新建 TCP 能力，也不会污染已有会话。
-
-**Q：TCP connect 探测有什么局限？**
-
-A：它只能证明端口能建立 TCP，不能证明应用逻辑正常。生产中可以增加协议级健康检查，但那会引入 L7 知识和更复杂的超时/响应校验。
-
-## 9. 模块七：ProxySession 核心业务状态机
-
-### 状态转换
-
-```text
-Accepted -> Connecting -> Established -> Draining -> Closed
-                 |             |             |
-                 +-------------+-------------+--> Closed on error/timeout
-```
-
-- `Accepted`：前端已接入，会话尚未启动。
-- `Connecting`：已选后端，客户早到数据留在 frontend input buffer。
-- `Established`：两端已建立，双向转发。
-- `Draining`：至少一个方向 EOF，继续排空缓存并传播半关闭。
-- `Closed`：终态，释放全部会话资源。
-
-### 双向转发
-
-```text
-frontend.input_buffer  --HandleFrontendData--> backend.output_buffer
-backend.input_buffer   --HandleBackendData---> frontend.output_buffer
-```
-
-后端连接失败时，会话会释放当前 lease，过滤已尝试 id，再在未尝试的健康后端中选择。一旦进入 Established，就不再中途切换后端，否则新后端无法理解旧连接已交互的协议状态。
-
-### 高低水位背压
-
-```text
-backend output >= high -> frontend.StopRead()
-backend output <= low  -> frontend.StartRead()
-
-frontend output >= high -> backend.StopRead()
-frontend output <= low  -> backend.StartRead()
-```
-
-高、低两个阈值构成滞回区间，避免缓冲在单一阈值附近波动时频繁 MOD epoll interest。暂停的始终是产生数据的来源方。
-
-### 半关闭
-
-客户 EOF 后不能立即 close：代理需要先把客户数据发完，再对后端 `shutdown(SHUT_WR)`，同时仍允许后端返回完整响应。只有双方 EOF 且两个 output buffer 都排空才完成关闭。
-
-### 面试问答
-
-**Q：为什么后端连接期间要缓存客户数据？**
-
-A：非阻塞 connect 有时间窗，客户可能在后端成功前已发数据。不缓存就只能丢弃或过早拒绝读取。本项目保留在 frontend input buffer，达到高水位后停读，连接成功后再有序发送。
-
-**Q：背压为什么不直接丢包？**
-
-A：TCP 应用期待可靠有序字节流，用户态代理丢字节会静默破坏协议。正确做法是暂停 EPOLLIN，让压力继续传导到内核接收缓冲和发送端 TCP 窗口。
-
-**Q：为什么 established 后不能故障转移到新后端？**
-
-A：L4 代理不理解上层会话状态，不知道已发数据的语义，也无法让新后端恢复旧状态。只能在 connect 成功前安全重试。
-
-**Q：如何保证多个终止事件同时到达时不 double free？**
-
-A：所有终止路径收敛到 `ProxySession::Close()`，它先检查并设置 `Closed`，后续调用立即返回。再结合 RAII、weak callback 和 loop-thread 串行化，保证 fd、Channel、Timer 和 lease 只释放一次。
-
-## 10. 模块八：L4ProxyServer、配置与生命周期
-
-### 启动流程
-
-```text
-parse and validate JSON
-  -> create base EventLoop
-  -> block SIGINT/SIGTERM before any child thread
-  -> construct L4ProxyServer
-  -> start worker pool
-  -> create worker-owned SessionMap
-  -> start data/admin Acceptor
-  -> start HealthChecker
-  -> EventLoop::Loop
-```
-
-配置在 bind/listen 之前完成全量校验，避免进程已部分启动后才发现水位、算法或后端地址无效。
-
-### 优雅退出
-
-Linux `signalfd` 把 SIGINT/SIGTERM 转为 EventLoop 事件。信号必须在创建日志和 worker 线程前屏蔽，使新线程继承 mask，否则信号可能命中其他线程并直接终止进程。
-
-```text
-signal
-  -> stop data/admin acceptors
-  -> stop health checker
-  -> wait existing sessions to drain
-  -> grace deadline: force-close remaining sessions
-  -> stop loops, join threads, flush logger
-```
-
-### 面试问答
-
-**Q：为什么不在信号处理函数中直接 Stop？**
-
-A：传统 signal handler 中只能调用 async-signal-safe 函数，锁、容器、`shared_ptr` 和大部分 C++ 逻辑都不安全。signalfd 让停机逻辑回到普通 EventLoop 上下文执行。
-
-**Q：优雅退出为什么需要 deadline？**
-
-A：只等待会话自然结束可能因长连接永不退出。宽限期在业务完整性和运维可控性之间做取舍，超时后必须强制收敛。
-
-## 11. 模块九：管理面、指标与异步日志
-
-管理 listener 默认绑定 loopback，提供：
-
-- `GET /healthz`：进程健康响应。
-- `GET /metrics`：当前/累计会话、双向字节、后端状态与活跃数、连接失败、超时和背压次数。
-
-指标在 worker 中通过原子变量更新，避免数据面加全局锁。`AsyncLogger` 只在前台组装 JSON 记录并入队，单独线程串行输出，停机时 flush 后 join。
-
-### 面试问答
-
-**Q：原子指标一定没有性能问题吗？**
-
-A：不一定。多 worker 频繁写同一 cache line 会产生缓存一致性开销和 false sharing。高性能版本可使用 per-worker 分片计数，查询时再聚合。
-
-**Q：为什么日志要异步？**
-
-A：磁盘或终端 I/O 延迟不可控，同步写会阻塞 EventLoop。异步日志把格式化后的记录交给后台线程，但要处理队列增长、停机 flush 和日志线程生命周期。
-
-**Q：`/healthz` 返回 200 是否代表所有后端都健康？**
-
-A：不一定。当前它是进程存活端点。后端健康需要查询 metrics。生产系统通常还会区分 liveness 和 readiness。
-
-## 12. 一条完整会话的业务时序
-
-```text
-1. Acceptor accept 客户 fd
-2. L4ProxyServer 选择 worker，投递 Socket
-3. worker 创建 frontend TcpConnection
-4. SessionMap 创建并持有 ProxySession
-5. ProxySession 安装回调，进入 Connecting
-6. LoadBalancer 从健康快照选择 BackendLease
-7. Connector 异步连接后端
-8. 后端成功，创建 backend TcpConnection
-9. 转发连接期间累积的客户数据
-10. 双向 message callback 透明转发
-11. 高水位停止来源读，低水位恢复
-12. EOF 后进入 Draining，排空后传播 shutdown-write
-13. 双向完成或错误/超时进入 Close
-14. 从 SessionMap 移除，RAII 释放所有资源
-```
-
-## 13. 如何用测试学习实现
-
-| 想学的内容 | 先读的测试 |
-|---|---|
-| Buffer/RAII | `BufferTest.cpp`、`SocketTest.cpp`、`UniqueFdTest.cpp` |
-| Reactor 与跨线程唤醒 | `EventLoopTest.cpp`、`EventLoopThreadTest.cpp` |
-| 非阻塞 connect | `ConnectorTest.cpp` |
-| RR/LC 与 lease | `LoadBalancerTest.cpp` |
-| 双向转发和半关闭 | `ProxySessionForwardsLargeOpaqueStreamsAndPreservesHalfClose` |
-| 背压 | `ProxySessionAppliesAndReleasesBackpressureInBothDirections` |
-| 重试 | `ProxySessionRetriesOnlyUnusedBackendsAndKeepsBufferedData` |
-| reset 与幂等关闭 | `ProxySessionHandlesBackendResetAndReleasesOwnershipExactlyOnce` |
-| 健康摘除/恢复 | `HealthCheckerTest.cpp` |
-| Multi-Reactor 与优雅停机 | `L4ProxyServerTest.cpp` |
-| 真实进程链路 | `tests/integration/smoke.py` |
-
-阅读每个测试时，先写下“初始状态—事件—预期状态—资源结果”，再去对照实现。
-
-## 14. 面试时如何介绍项目
-
-可以用下面的 90 秒版本：
-
-> 我在一个 C++ Reactor 网络库的基础上实现了 Linux 用户态 L4 TCP 负载均衡器。架构采用主从 Reactor，主线程 accept 后将 fd 轮询投递给 worker，每个会话的前后端连接都归同一 EventLoop 所有，数据面无需加锁。我实现了 Round Robin 和 Least Connections，用 RAII BackendLease 管理活跃数，用不可变快照发布健康后端。ProxySession 负责非阻塞连接、有界重试、双向透明转发、高低水位背压和 TCP 半关闭。fd、定时器、线程和计数都使用 RAII 管理，所有异常路径收敛到幂等 Close。此外还有主动健康检查、metrics、异步结构化日志和 SIGTERM 优雅退出。项目在 Debug、Release、ASan/UBSan 和 TSan 下通过了故障与端到端测试。
-
-面试时不要只列功能，要主动说出三个设计取舍：
-
-1. 选择用户态 Buffer，放弃当前就上 `splice/io_uring`，优先保证生命周期正确。
-2. 同一会话固定在一个 worker，用线程归属换取无锁数据面。
-3. 健康变化只影响新连接，不中断已有会话，保护业务完整性。
-
-## 15. 可继续深挖的问题
-
-当你能讲清当前实现后，可以继续思考：
-
-- 如何将全局原子 metrics 改为 per-worker 分片？
-- 如何支持加权 RR 或 EWMA latency 调度？
-- 如何设计配置热加载，又不影响已有会话？
-- 如何限制全局连接数、单 IP 连接数和新建速率？
-- 如何处理 EMFILE 时的 idle-fd 技巧？
-- `splice` 如何与背压、半关闭和跨 fd 错误处理结合？
-- 如何将 TCP 健康检查升级为可插拔的 L7 探测？
-- 如何用一致性哈希增加会话亲和性？
-
-这些问题没有唯一答案。面试官更关心你能否说清需求、不变式、失败路径和取舍。
+扩展学习顺序建议：先熟练解释现有主线，再增加高低水位、第二种算法，最后考虑多线程和健康检查。不要一次把所有扩展重新塞回业务层。

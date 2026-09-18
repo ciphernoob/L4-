@@ -9,6 +9,9 @@
 #include <cerrno>
 #include <chrono>
 #include <memory>
+#include <poll.h>
+#include <sys/socket.h>
+#include <vector>
 
 using l4lb::lb::Connector;
 using l4lb::net::Acceptor;
@@ -17,6 +20,29 @@ using l4lb::net::InetAddress;
 using l4lb::net::Socket;
 using l4lb::net::TcpConnection;
 using l4lb::net::TimerId;
+
+namespace {
+// 填满本机 listen 队列但不 accept，确定性地制造 pending connect。
+// 不依赖公网路由、防火墙或 192.0.2.0/24 在当前网络里的行为。
+struct FullBacklog {
+    Socket listener = Socket::CreateTcpNonBlocking();
+    std::vector<Socket> clients;
+    FullBacklog() {
+        listener.Bind({"127.0.0.1", 0});
+        listener.Listen(1);
+        const auto address = listener.LocalAddress().SockAddr();
+        for (int i = 0; i < 2; ++i) {
+            Socket client = Socket::CreateTcpNonBlocking();
+            const int result = ::connect(client.Fd(), reinterpret_cast<const sockaddr*>(&address), sizeof(address));
+            L4LB_REQUIRE(result == 0 || errno == EINPROGRESS);
+            pollfd event{client.Fd(), POLLOUT, 0};
+            L4LB_REQUIRE(::poll(&event, 1, 1000) == 1);
+            L4LB_REQUIRE(client.GetSocketError() == 0);
+            clients.push_back(std::move(client));
+        }
+    }
+};
+}
 
 L4LB_TEST(ConnectorCompletesNonBlockingConnectionAndTransfersSocket) {
     EventLoop loop;
@@ -83,10 +109,11 @@ L4LB_TEST(ConnectorReportsConnectionRefused) {
 
 L4LB_TEST(ConnectorCancellationIsIdempotent) {
     EventLoop loop;
+    FullBacklog blocked;
     int callbacks = 0;
     int error_number = 0;
     std::shared_ptr<Connector> connector(new Connector(
-        &loop, InetAddress("192.0.2.1", 65000), std::chrono::seconds(1)));
+        &loop, blocked.listener.LocalAddress(), std::chrono::seconds(1)));
     connector->SetErrorCallback(
         [&](const std::shared_ptr<Connector>&, const std::error_code& error) {
             ++callbacks;
@@ -105,9 +132,10 @@ L4LB_TEST(ConnectorCancellationIsIdempotent) {
 
 L4LB_TEST(ConnectorAppliesConnectionTimeout) {
     EventLoop loop;
+    FullBacklog blocked;
     int error_number = 0;
     std::shared_ptr<Connector> connector(new Connector(
-        &loop, InetAddress("192.0.2.1", 65000), std::chrono::milliseconds(1)));
+        &loop, blocked.listener.LocalAddress(), std::chrono::milliseconds(1)));
     connector->SetErrorCallback(
         [&](const std::shared_ptr<Connector>&, const std::error_code& error) {
             error_number = error.value();
@@ -120,4 +148,3 @@ L4LB_TEST(ConnectorAppliesConnectionTimeout) {
     L4LB_REQUIRE(error_number == ETIMEDOUT);
     watchdog.Cancel();
 }
-

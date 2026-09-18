@@ -1,46 +1,51 @@
 #include "lb/LoadBalancer.h"
 
-#include <limits>
+#include "lb/ProxySession.h"
+#include "net/EventLoop.h"
+
+#include <stdexcept>
 
 namespace l4lb {
 namespace lb {
 
-SelectionResult LoadBalancer::NoBackend(
-    const std::shared_ptr<const BackendSnapshot>& snapshot) {
-    if (snapshot && snapshot->counters) {
-        snapshot->counters->no_available_backend.fetch_add(1, std::memory_order_relaxed);
+LoadBalancer::LoadBalancer(net::EventLoop* loop, const net::InetAddress& listen,
+                           std::vector<net::InetAddress> backends)
+    : loop_(loop), acceptor_(loop, listen, false), backends_(std::move(backends)) {
+    if (backends_.empty()) {
+        throw std::invalid_argument("at least one backend is required");
     }
-    return SelectionResult{BackendLease(), SelectionError::kNoAvailableBackend};
+    acceptor_.SetNewConnectionCallback([this](net::Socket socket, const net::InetAddress&) {
+        OnNewConnection(std::move(socket));
+    });
 }
 
-SelectionResult RoundRobinLoadBalancer::Select(
-    const std::shared_ptr<const BackendSnapshot>& snapshot) {
-    if (!snapshot || snapshot->candidates.empty()) {
-        return NoBackend(snapshot);
-    }
-    const std::uint64_t current = sequence_.fetch_add(1, std::memory_order_relaxed);
-    std::shared_ptr<Backend> backend =
-        snapshot->candidates[current % snapshot->candidates.size()];
-    return SelectionResult{BackendLease::Acquire(std::move(backend)), SelectionError::kNone};
+LoadBalancer::~LoadBalancer() {
+    Stop();
 }
 
-SelectionResult LeastConnectionsLoadBalancer::Select(
-    const std::shared_ptr<const BackendSnapshot>& snapshot) {
-    if (!snapshot || snapshot->candidates.empty()) {
-        return NoBackend(snapshot);
+void LoadBalancer::Start() {
+    acceptor_.Start();
+}
+
+void LoadBalancer::OnNewConnection(net::Socket socket) {
+    // 轮询以 TCP 连接为粒度；后续消息始终交给这个 session。
+    const auto address = backends_[next_backend_];
+    next_backend_ = (next_backend_ + 1) % backends_.size();
+    const int fd = socket.Fd();
+    auto session = std::make_shared<ProxySession>(loop_, std::move(socket), address);
+    session->SetCloseCallback([this, fd] { sessions_.erase(fd); });
+    sessions_.emplace(fd, session);  // 必须先持有，再启动可能立即失败的 connect。
+    session->Start();
+}
+
+void LoadBalancer::Stop() {
+    loop_->AssertInLoopThread();
+    acceptor_.Stop();
+    while (!sessions_.empty()) {
+        auto session = sessions_.begin()->second;
+        session->Close();  // 回调从 map 中删除自身。
     }
-    std::shared_ptr<Backend> selected;
-    std::size_t minimum = std::numeric_limits<std::size_t>::max();
-    for (const std::shared_ptr<Backend>& backend : snapshot->candidates) {
-        const std::size_t active = backend->ActiveSessions();
-        if (active < minimum) {
-            selected = backend;
-            minimum = active;
-        }
-    }
-    return SelectionResult{BackendLease::Acquire(std::move(selected)), SelectionError::kNone};
 }
 
 }  // namespace lb
 }  // namespace l4lb
-
